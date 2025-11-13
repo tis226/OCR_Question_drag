@@ -355,8 +355,8 @@ def perform_easyocr_export(
 
     grouped = group_easyocr_detections(detections_by_page)
 
-    subject_value = subject if subject else "Unknown"
-    target_value = target if target else "Default"
+    subject_value = subject if subject is not None else None
+    target_value = target if target is not None else None
 
     payload: List[Dict[str, Any]] = []
     for entry in grouped:
@@ -2853,13 +2853,23 @@ def launch_omit_gui(doc: fitz.Document, *, zoom: float = 1.0) -> List[OmitRegion
 # ------------------ CLI & main ------------------
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Annotate question regions in a PDF using metadata from a JSON file.")
+    parser = argparse.ArgumentParser(
+        description="Annotate question regions in a PDF using metadata from a JSON file."
+    )
     parser.add_argument("--pdf", required=True, type=Path, help="Input PDF to annotate.")
     parser.add_argument("--trace-dir", type=Path,
     help="Directory to dump per-question extraction traces (one JSON per question).")
 
-    parser.add_argument("--json", required=True, type=Path, help="Question metadata JSON.")
-    parser.add_argument("--output", required=True, type=Path, help="Destination PDF path.")
+    parser.add_argument(
+        "--json",
+        type=Path,
+        help="Question metadata JSON (required unless running EasyOCR export only).",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Destination PDF path (required when generating annotated output).",
+    )
     parser.add_argument("--subject", help="Filter questions by subject.")
     parser.add_argument("--year", type=int, help="Filter questions by exam year.")
     parser.add_argument("--target", help="Filter questions by target/audience.")
@@ -2906,32 +2916,53 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s: %(message)s")
 
-    if args.output.exists() and not args.overwrite:
-        logging.error("Output file %s already exists (use --overwrite to replace it).", args.output)
-        return 1
     if not args.pdf.exists():
         logging.error("PDF file not found: %s", args.pdf)
         return 1
-    if not args.json.exists():
+    if args.json and not args.json.exists():
         logging.error("JSON file not found: %s", args.json)
         return 1
 
-    questions = load_questions(args.json, subject=args.subject, year=args.year, target=args.target, only_numbers=args.question)
-    if not questions:
-        logging.error("No questions matched the provided filters.")
+    questions: List[Question] = []
+    if args.json:
+        questions = load_questions(
+            args.json,
+            subject=args.subject,
+            year=args.year,
+            target=args.target,
+            only_numbers=args.question,
+        )
+        if not questions:
+            logging.error("No questions matched the provided filters.")
+            return 1
+        if args.output is None:
+            logging.error("--output is required when processing question metadata.")
+            return 1
+    elif not args.ocr_export:
+        logging.error("Either provide --json or enable --ocr-export for OCR-only extraction.")
+        return 1
+
+    if args.output and args.output.exists() and not args.overwrite:
+        logging.error("Output file %s already exists (use --overwrite to replace it).", args.output)
         return 1
 
     with fitz.open(args.pdf) as doc:
         omit_regions: List[OmitRegion] = []
         if args.omit_gui:
             omit_regions = launch_omit_gui(doc)
-        index = LinearPdfIndex(doc, omit_regions=omit_regions)
-        if omit_regions:
-            logging.info("Omitting %s regions across %s pages", len(omit_regions), len({r.page_index for r in omit_regions}))
+        index = None
+        if questions or args.dump_text or args.review_chunks or args.chunk_overrides or args.mismatch_report or args.explanation_json:
+            index = LinearPdfIndex(doc, omit_regions=omit_regions)
+            if omit_regions:
+                logging.info(
+                    "Omitting %s regions across %s pages",
+                    len(omit_regions),
+                    len({r.page_index for r in omit_regions}),
+                )
 
-        if args.dump_text:
-            logging.info("Writing linearized text to %s", args.dump_text)
-            index.dump_text(args.dump_text)
+            if args.dump_text and index:
+                logging.info("Writing linearized text to %s", args.dump_text)
+                index.dump_text(args.dump_text)
 
         if args.ocr_export:
             try:
@@ -2973,6 +3004,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         logging.error("Failed to write EasyOCR export to %s: %s", args.ocr_export, exc)
                 if not ocr_payload:
                     logging.warning("EasyOCR export produced no question groups.")
+
+        if args.ocr_export and not questions:
+            # Pure OCR extraction; no further chunking work required.
+            return 0
+
+        if not index:
+            logging.error("Unable to build linear index required for chunking.")
+            return 1
 
         matches, mismatches = match_questions_to_blocks(index, questions)
         baseline_ranges: Dict[int, Tuple[int, int]] = {
