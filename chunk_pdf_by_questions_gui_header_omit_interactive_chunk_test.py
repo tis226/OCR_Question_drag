@@ -2924,6 +2924,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
 
     questions: List[Question] = []
+    ocr_payload: Optional[List[Dict[str, Any]]] = None
     if args.json:
         questions = load_questions(
             args.json,
@@ -3005,8 +3006,42 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 if not ocr_payload:
                     logging.warning("EasyOCR export produced no question groups.")
 
-        if args.ocr_export and not questions:
-            # Pure OCR extraction; no further chunking work required.
+        if not questions and ocr_payload:
+            synthesized_questions: List[Question] = []
+            for entry in ocr_payload:
+                content = entry.get("content") or {}
+                number = content.get("question_number")
+                text = content.get("question_text")
+                if number is None or text is None:
+                    continue
+                try:
+                    number_int = int(number)
+                except (TypeError, ValueError):
+                    logging.debug("Skipping OCR entry with non-integer question number: %r", number)
+                    continue
+                normalized = normalize_text(str(text))
+                if not normalized:
+                    logging.debug("Skipping OCR entry %s (empty after normalization)", number)
+                    continue
+                synthesized_questions.append(
+                    Question(number=number_int, text=str(text), normalized=normalized, raw_entry=entry)
+                )
+            if synthesized_questions:
+                synthesized_questions.sort(key=lambda q: q.number)
+                questions = synthesized_questions
+                logging.info(
+                    "Using %s OCR-derived questions for chunking/annotation workflows.",
+                    len(questions),
+                )
+            else:
+                logging.warning("OCR export did not produce usable questions for chunking workflows.")
+
+        if questions and args.output is None:
+            logging.error("--output is required when chunking question metadata.")
+            return 1
+
+        if not questions:
+            # Pure OCR extraction without any chunking context.
             return 0
 
         if not index:
