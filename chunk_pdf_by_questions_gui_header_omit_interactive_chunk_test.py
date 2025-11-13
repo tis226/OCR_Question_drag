@@ -32,7 +32,7 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Set
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Set
 from charwise_trace_extractor import extract_explanation_text_charwise_trace, print_trace
 
 try:
@@ -61,11 +61,26 @@ try:
 except ImportError:
     pd = None
 
+try:
+    import numpy as np  # type: ignore
+except ImportError:
+    np = None
+
+try:
+    import easyocr  # type: ignore
+except ImportError:
+    easyocr = None
+
 PDFPLUMBER_AVAILABLE = pdfplumber is not None and pd is not None
 CAMEL0T_AVAILABLE = PDFPLUMBER_AVAILABLE and camelot is not None and PdfReader is not None
 
 SOFT_HYPHEN = "\u00ad"
 CONTROL_GAP_CHARS = {"\u0001"}
+
+CIRCLED_NUMBER_CHARS = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
+CIRCLED_NUMBER_PATTERN = re.compile(f"[{CIRCLED_NUMBER_CHARS}]")
+CIRCLED_NUMBER_ORDER = {symbol: idx for idx, symbol in enumerate(CIRCLED_NUMBER_CHARS, start=1)}
+QUESTION_NUMBER_PATTERN = re.compile(r"^\s*(\d{1,3})(?:\s*[).]|\s*번\b)")
 
 
 def _rebuild_line_text(line: Dict[str, object], gap_factor: float = 0.35, min_gap: float = 0.3) -> str:
@@ -125,6 +140,256 @@ def normalize_text(text: str) -> str:
         if category and category[0] in ("L", "N"):
             keep.append(ch.lower())
     return "".join(keep)
+
+
+def _require_numpy() -> None:
+    if np is None:
+        raise RuntimeError("NumPy is required for EasyOCR processing. Install it via 'pip install numpy'.")
+
+
+def _require_easyocr() -> None:
+    if easyocr is None:
+        raise RuntimeError("EasyOCR is required for --ocr-export. Install it via 'pip install easyocr'.")
+
+
+def render_pdf_to_images(
+    doc: fitz.Document,
+    *,
+    dpi: int = 300,
+    page_indices: Optional[Sequence[int]] = None,
+) -> List[Tuple[int, Any]]:
+    """Render PDF pages to NumPy arrays suitable for EasyOCR."""
+
+    _require_numpy()
+    zoom = max(dpi / 72.0, 1.0)
+    matrix = fitz.Matrix(zoom, zoom)
+    rendered: List[Tuple[int, Any]] = []
+    for page_index in range(doc.page_count):
+        if page_indices is not None and page_index not in page_indices:
+            continue
+        page = doc[page_index]
+        pix = page.get_pixmap(matrix=matrix, alpha=False)
+        buffer = pix.samples
+        array = np.frombuffer(buffer, dtype=np.uint8).copy()
+        array = array.reshape(pix.h, pix.w, pix.n)
+        if pix.n == 4:
+            array = array[:, :, :3]
+        rendered.append((page_index, array))
+    return rendered
+
+
+def _bbox_from_easyocr(points: Sequence[Sequence[float]]) -> List[float]:
+    xs = [float(pt[0]) for pt in points]
+    ys = [float(pt[1]) for pt in points]
+    return [min(xs), min(ys), max(xs), max(ys)]
+
+
+def _split_circled_options(text: str) -> Tuple[str, List[Tuple[str, str]]]:
+    """Split leading text from circled-number options within a single OCR snippet."""
+
+    matches = list(CIRCLED_NUMBER_PATTERN.finditer(text))
+    if not matches:
+        return text.strip(), []
+
+    leading_end = matches[0].start()
+    leading = text[:leading_end].strip()
+    options: List[Tuple[str, str]] = []
+    for idx, match in enumerate(matches):
+        symbol = match.group(0)
+        start = match.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        option_text = text[start:end].strip()
+        options.append((symbol, option_text))
+    return leading, options
+
+
+def _append_option_text(options: List[Dict[str, str]], symbol: str, text: str) -> None:
+    cleaned = text.strip()
+    if not cleaned:
+        return
+    for option in options:
+        if option.get("index") == symbol:
+            existing = option.get("text", "").strip()
+            option["text"] = f"{existing}\n{cleaned}".strip() if existing else cleaned
+            return
+    options.append({"index": symbol, "text": cleaned})
+
+
+def group_easyocr_detections(
+    detections_by_page: Sequence[Sequence[Dict[str, Any]]]
+) -> List[Dict[str, Any]]:
+    """Group EasyOCR detections into question-centric structures."""
+
+    flattened: List[Dict[str, Any]] = []
+    for page_items in detections_by_page:
+        flattened.extend(page_items)
+
+    flattened.sort(key=lambda item: (item["page_index"], item["bbox"][1], item["bbox"][0]))
+
+    grouped: List[Dict[str, Any]] = []
+    current: Optional[Dict[str, Any]] = None
+
+    for item in flattened:
+        text = str(item.get("text", "")).strip()
+        if not text:
+            continue
+
+        snippet = {
+            "page_index": item["page_index"],
+            "bbox": item["bbox"],
+            "text": text,
+            "confidence": float(item.get("confidence", 0.0)),
+        }
+
+        question_match = QUESTION_NUMBER_PATTERN.match(text)
+        if question_match:
+            if current:
+                grouped.append(
+                    {
+                        "number": current["number"],
+                        "text": "\n".join(part for part in current["text_parts"] if part).strip(),
+                        "options": current["options"],
+                        "snippets": current["snippets"],
+                    }
+                )
+            number = int(question_match.group(1))
+            remainder = text[question_match.end() :].strip()
+            leading, options = _split_circled_options(remainder)
+            current = {
+                "number": number,
+                "text_parts": [leading] if leading else [],
+                "options": [],
+                "snippets": [snippet],
+                "options_started": False,
+            }
+            if options:
+                current["options_started"] = True
+                for symbol, option_text in options:
+                    _append_option_text(current["options"], symbol, option_text)
+            continue
+
+        if current is None:
+            continue
+
+        current["snippets"].append(snippet)
+
+        leading, options = _split_circled_options(text)
+        if leading:
+            if not current["options_started"]:
+                current["text_parts"].append(leading)
+            elif current["options"]:
+                last = current["options"][-1]
+                last_text = last.get("text", "").strip()
+                last["text"] = f"{last_text}\n{leading}".strip() if last_text else leading
+            else:
+                current["text_parts"].append(leading)
+
+        if options:
+            current["options_started"] = True
+            for symbol, option_text in options:
+                _append_option_text(current["options"], symbol, option_text)
+        elif current["options_started"] and not options and leading and current["options"]:
+            # Already appended to the last option above.
+            pass
+        elif current["options_started"] and not options and not leading and current["options"]:
+            # Continuation lines without explicit markers belong to the last option; no-op here.
+            continue
+
+    if current:
+        grouped.append(
+            {
+                "number": current["number"],
+                "text": "\n".join(part for part in current["text_parts"] if part).strip(),
+                "options": current["options"],
+                "snippets": current["snippets"],
+            }
+        )
+
+    return grouped
+
+
+def perform_easyocr_export(
+    doc: fitz.Document,
+    *,
+    languages: Optional[Sequence[str]] = None,
+    gpu: bool = False,
+    dpi: int = 300,
+    subject: Optional[str] = None,
+    year: Optional[int] = None,
+    target: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Run EasyOCR on the PDF and return question-structured payloads."""
+
+    _require_numpy()
+    _require_easyocr()
+
+    langs = list(dict.fromkeys(languages or ["ko", "en"]))
+    reader = easyocr.Reader(langs, gpu=gpu)
+
+    rendered_pages = render_pdf_to_images(doc, dpi=dpi)
+    detections_by_page: List[List[Dict[str, Any]]] = []
+    for page_index, image in rendered_pages:
+        detections: List[Dict[str, Any]] = []
+        try:
+            page_results = reader.readtext(image, detail=1, paragraph=False)
+        except Exception as exc:  # pylint: disable=broad-except
+            logging.error("EasyOCR failed on page %s: %s", page_index + 1, exc)
+            page_results = []
+        for result in page_results:
+            if not isinstance(result, (list, tuple)) or len(result) < 3:
+                continue
+            points, text, confidence = result[:3]
+            text_str = str(text or "").strip()
+            if not text_str:
+                continue
+            bbox = _bbox_from_easyocr(points)
+            detections.append(
+                {
+                    "page_index": page_index,
+                    "bbox": bbox,
+                    "text": text_str,
+                    "confidence": float(confidence) if confidence is not None else 0.0,
+                }
+            )
+        detections_by_page.append(detections)
+
+    grouped = group_easyocr_detections(detections_by_page)
+
+    subject_value = subject if subject else "Unknown"
+    target_value = target if target else "Default"
+
+    payload: List[Dict[str, Any]] = []
+    for entry in grouped:
+        sorted_options = sorted(
+            (
+                {
+                    "index": option["index"],
+                    "text": option.get("text", "").strip(),
+                }
+                for option in entry.get("options", [])
+                if option.get("text")
+            ),
+            key=lambda opt: CIRCLED_NUMBER_ORDER.get(opt["index"], 999),
+        )
+        content = {
+            "question_number": entry.get("number"),
+            "question_text": entry.get("text", ""),
+            "dispute_bool": False,
+            "dispute_site": None,
+            "options": sorted_options,
+            "preview_image": None,
+            "ocr_snippets": entry.get("snippets", []),
+        }
+        payload.append(
+            {
+                "subject": subject_value,
+                "year": year,
+                "target": target_value,
+                "content": content,
+            }
+        )
+
+    return payload
 
 
 @dataclass
@@ -2622,6 +2887,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=Path,
         help="Optional JSON file to load/save manual chunk boundary overrides (per question).",
     )
+    parser.add_argument("--ocr-export", type=Path, help="Write EasyOCR-derived question chunks to this JSON file.")
+    parser.add_argument(
+        "--ocr-langs",
+        nargs="+",
+        dest="ocr_langs",
+        help="Language codes for EasyOCR (default: ko en).",
+    )
+    parser.add_argument("--ocr-gpu", action="store_true", help="Enable GPU acceleration for EasyOCR processing.")
+    parser.add_argument("--ocr-dpi", type=int, default=300, help="Rendering DPI for EasyOCR preprocessing.")
     # Charwise tunables
     parser.add_argument("--charwise-max-mismatches", type=int, default=2, help="Max wordlike mismatches while consuming option prefix.")
     parser.add_argument("--charwise-max-lead", type=int, default=6, help="Max leading non-word chars to ignore before option.")
@@ -2658,6 +2932,47 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.dump_text:
             logging.info("Writing linearized text to %s", args.dump_text)
             index.dump_text(args.dump_text)
+
+        if args.ocr_export:
+            try:
+                ocr_payload = perform_easyocr_export(
+                    doc,
+                    languages=args.ocr_langs,
+                    gpu=args.ocr_gpu,
+                    dpi=args.ocr_dpi,
+                    subject=args.subject,
+                    year=args.year,
+                    target=args.target,
+                )
+            except RuntimeError as exc:
+                logging.error("Skipping EasyOCR export: %s", exc)
+            except Exception as exc:  # pylint: disable=broad-except
+                logging.error("EasyOCR export failed: %s", exc)
+            else:
+                destination = args.ocr_export
+                parent = destination.parent
+                dir_ready = True
+                if parent and not parent.exists():
+                    try:
+                        parent.mkdir(parents=True, exist_ok=True)
+                    except OSError as exc:
+                        logging.error("Failed to create directory %s: %s", parent, exc)
+                        dir_ready = False
+                if dir_ready:
+                    try:
+                        destination.write_text(
+                            json.dumps(ocr_payload, ensure_ascii=False, indent=2),
+                            encoding="utf-8",
+                        )
+                        logging.info(
+                            "Wrote EasyOCR export (%s questions) to %s",
+                            len(ocr_payload),
+                            args.ocr_export,
+                        )
+                    except OSError as exc:
+                        logging.error("Failed to write EasyOCR export to %s: %s", args.ocr_export, exc)
+                if not ocr_payload:
+                    logging.warning("EasyOCR export produced no question groups.")
 
         matches, mismatches = match_questions_to_blocks(index, questions)
         baseline_ranges: Dict[int, Tuple[int, int]] = {
