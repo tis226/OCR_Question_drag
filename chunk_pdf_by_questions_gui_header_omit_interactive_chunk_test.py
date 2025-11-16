@@ -2857,16 +2857,23 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         description="Annotate question regions in a PDF using metadata from a JSON file."
     )
     parser.add_argument("--pdf", required=True, type=Path, help="Input PDF to annotate.")
-    parser.add_argument("--trace-dir", type=Path,
-    help="Directory to dump per-question extraction traces (one JSON per question).")
+    parser.add_argument(
+        "--trace-dir",
+        type=Path,
+        help="Directory to dump per-question extraction traces (one JSON per question).",
+    )
 
     parser.add_argument(
         "--json",
+        dest="json",
+        default=None,
         type=Path,
         help="Question metadata JSON (required unless running EasyOCR export only).",
     )
     parser.add_argument(
         "--output",
+        dest="output",
+        default=None,
         type=Path,
         help="Destination PDF path (required when generating annotated output).",
     )
@@ -2897,7 +2904,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=Path,
         help="Optional JSON file to load/save manual chunk boundary overrides (per question).",
     )
-    parser.add_argument("--ocr-export", type=Path, help="Write EasyOCR-derived question chunks to this JSON file.")
+    parser.add_argument(
+        "--ocr-export",
+        dest="ocr_export",
+        default=None,
+        type=Path,
+        help="Write EasyOCR-derived question chunks to this JSON file.",
+    )
     parser.add_argument(
         "--ocr-langs",
         nargs="+",
